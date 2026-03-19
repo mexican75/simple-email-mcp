@@ -1,0 +1,9 @@
+accounts.json
+migrate_config.json
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+build/
+dist/
+uv.lock
