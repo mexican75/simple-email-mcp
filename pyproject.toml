@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-email-mcp"
+version = "1.0.0"
+description = "Provider-agnostic MCP server for email (IMAP/SMTP)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Ramon Ramirez", email = "3713936+mexican75@users.noreply.github.com"}
+]
+keywords = ["mcp", "email", "imap", "smtp", "claude", "mcp-server"]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "pydantic>=2.0.0",
+]
+
+[project.scripts]
+simple-email-mcp = "simple_email_mcp:main"
+
+[project.urls]
+Homepage = "https://github.com/mexican75/simple-email-mcp"
+Repository = "https://github.com/mexican75/simple-email-mcp"
+Issues = "https://github.com/mexican75/simple-email-mcp/issues"
+
+[tool.setuptools]
+py-modules = ["simple_email_mcp"]
