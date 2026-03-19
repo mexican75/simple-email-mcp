@@ -1,0 +1,26 @@
+{
+  "send_code": "",
+  "accounts": [
+    {
+      "name": "personal",
+      "address": "me@example.com",
+      "password": "your-app-password",
+      "provider": "gmail"
+    },
+    {
+      "name": "work",
+      "address": "me@company.com",
+      "password": "your-app-password",
+      "provider": "outlook"
+    },
+    {
+      "name": "custom",
+      "address": "me@mydomain.com",
+      "password": "your-password",
+      "imap_host": "imap.mydomain.com",
+      "imap_port": 993,
+      "smtp_host": "smtp.mydomain.com",
+      "smtp_port": 465
+    }
+  ]
+}
