@@ -27,7 +27,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from email.header import decode_header
-from email.utils import parseaddr, parsedate_to_datetime, formatdate, make_msgid
+from email.utils import parseaddr, parsedate_to_datetime, formatdate, make_msgid, getaddresses
 from typing import Optional, Dict, Any
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -47,7 +47,10 @@ _send_code: Optional[str] = None
 _sent_folder_cache: Dict[str, str] = {}
 
 def _load_accounts() -> None:
-    global _accounts, _send_code
+    global _accounts, _send_code, _sent_folder_cache
+    _accounts = {}
+    _send_code = None
+    _sent_folder_cache = {}
     config_path = os.environ.get("ACCOUNTS_FILE", str(Path(__file__).parent / "accounts.json"))
     if os.path.exists(config_path):
         with open(config_path, "r") as f:
@@ -85,7 +88,20 @@ def _load_accounts() -> None:
 
 _load_accounts()
 
+def _refresh_runtime_config() -> None:
+    _load_accounts()
+
+def _check_confirmation_code(confirmation_code: Optional[str]) -> Optional[str]:
+    _refresh_runtime_config()
+    if _send_code:
+        if not confirmation_code:
+            return "BLOCKED: A confirmation code is required. Show the draft to the user and ask for their code."
+        if confirmation_code.strip() != _send_code.strip():
+            return "BLOCKED: Invalid confirmation code. The email was NOT sent."
+    return None
+
 def _resolve_account(account: Optional[str]) -> Dict[str, Any]:
+    _refresh_runtime_config()
     if not _accounts:
         raise RuntimeError("No email accounts configured.")
     if not account:
@@ -94,14 +110,18 @@ def _resolve_account(account: Optional[str]) -> Dict[str, Any]:
         available = ", ".join(f"'{n}' ({c['address']})" for n, c in _accounts.items())
         raise ValueError(f"Multiple accounts configured. You must specify which one: {available}")
     key = account.lower().strip()
-    if key in _accounts:
-        return _accounts[key]
     for name, cfg in _accounts.items():
-        if key in name.lower():
+        if key == name.lower() or key == cfg["address"].lower():
             return cfg
+    partial_matches = []
     for name, cfg in _accounts.items():
-        if key in cfg["address"].lower():
-            return cfg
+        if key in name.lower() or key in cfg["address"].lower():
+            partial_matches.append((name, cfg))
+    if len(partial_matches) == 1:
+        return partial_matches[0][1]
+    if len(partial_matches) > 1:
+        available = ", ".join(f"'{name}' ({cfg['address']})" for name, cfg in partial_matches)
+        raise ValueError(f"Account '{account}' is ambiguous. Matches: {available}")
     available = ", ".join(f"'{n}'" for n in _accounts)
     raise ValueError(f"Account '{account}' not found. Available: {available}")
 
@@ -118,7 +138,12 @@ def _imap_session(acct: Dict[str, Any], folder: Optional[str] = None, readonly: 
         try:
             conn = _imap_connect(acct)
             if folder:
-                conn.select(folder, readonly=readonly)
+                status, data = conn.select(folder, readonly=readonly)
+                if status != "OK":
+                    detail = ""
+                    if data and data[0]:
+                        detail = data[0].decode("utf-8", errors="replace") if isinstance(data[0], bytes) else str(data[0])
+                    raise RuntimeError(f"Could not select folder '{folder}'" + (f": {detail}" if detail else ""))
             break
         except Exception as e:
             last_err = e
@@ -278,6 +303,44 @@ def _quote_body(body: str, sender: str, date: str) -> str:
     quoted = "\n".join(f"> {line}" for line in body.splitlines())
     return f"On {date}, {sender} wrote:\n{quoted}"
 
+def _parse_address_list(*fields: Optional[str]) -> list[str]:
+    addresses = []
+    seen = set()
+    for _, addr in getaddresses([field for field in fields if field]):
+        normalized = addr.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            addresses.append(addr.strip())
+    return addresses
+
+def _split_attachment_paths(file_attachments: Optional[str]) -> list[str]:
+    if not file_attachments:
+        return []
+    return [filepath.strip() for filepath in file_attachments.split(",") if filepath.strip()]
+
+def _collect_attachment_metadata(file_attachments: Optional[str]) -> tuple[list[dict], int]:
+    attachment_info = []
+    total_size = 0
+    for filepath in _split_attachment_paths(file_attachments):
+        resolved_path = str(Path(filepath).expanduser().resolve(strict=False))
+        exists = os.path.isfile(filepath)
+        size_bytes = os.path.getsize(filepath) if exists else None
+        content_type, _ = mimetypes.guess_type(filepath)
+        if content_type is None:
+            content_type = "application/octet-stream"
+        entry = {
+            "path": filepath,
+            "resolved_path": resolved_path,
+            "filename": os.path.basename(filepath),
+            "exists": exists,
+            "size_bytes": size_bytes,
+            "content_type": content_type,
+        }
+        attachment_info.append(entry)
+        if size_bytes is not None:
+            total_size += size_bytes
+    return attachment_info, total_size
+
 def _compose_and_send(
     acct: Dict[str, Any], to: str, subject: str, body: str,
     body_html: Optional[str] = None, cc: Optional[str] = None, bcc: Optional[str] = None,
@@ -401,6 +464,11 @@ class SaveAttachmentInput(BaseModel):
     folder: str = Field(default="INBOX", description="IMAP folder")
     attachment_index: int = Field(..., description="Index of the attachment (from email_read_email)", ge=0)
     save_path: str = Field(..., description="FULL file path to save to (e.g., C:\\Users\\me\\Downloads\\report.pdf on Windows, /tmp/report.pdf on Linux)", min_length=1)
+    overwrite: bool = Field(default=False, description="If false and save_path already exists, the tool fails and asks for explicit overwrite=true.")
+
+class PrepareAttachmentsInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    attachments: str = Field(..., description="Comma-separated FULL file paths to inspect before sending", min_length=1)
 
 class SendEmailInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -496,6 +564,7 @@ class ForwardEmailInput(BaseModel):
 @mcp.tool(name="email_list_accounts", annotations={"title": "List Email Accounts", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
 async def email_list_accounts(params: ListAccountsInput) -> str:
     """List all configured email accounts.\n\nShows the account name (used in the 'account' parameter of other tools)\nand the associated email address. Does NOT expose passwords.\n"""
+    _refresh_runtime_config()
     if not _accounts:
         return "No accounts configured. See README for setup."
     accounts_info = [{"name": n, "address": c["address"], "imap_host": c["imap_host"], "smtp_host": c["smtp_host"]} for n, c in _accounts.items()]
@@ -626,6 +695,26 @@ async def email_get_attachment(params: GetAttachmentInput) -> str:
     except Exception as e:
         return f"Error getting attachment: {e}"
 
+@mcp.tool(name="email_prepare_attachments", annotations={"title": "Prepare Email Attachments", "readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
+async def email_prepare_attachments(params: PrepareAttachmentsInput) -> str:
+    """Inspect local file attachments before sending.\n\nReturns metadata only: original path, resolved path, filename, existence,\nsize, and MIME type. This is useful for preflight confirmation without\nreading file contents into conversation context.\n"""
+    try:
+        attachments, total_size = _collect_attachment_metadata(params.attachments)
+        missing = [item["path"] for item in attachments if not item["exists"]]
+        return json.dumps(
+            {
+                "attachments": attachments,
+                "count": len(attachments),
+                "existing_count": sum(1 for item in attachments if item["exists"]),
+                "missing_count": len(missing),
+                "missing": missing,
+                "total_size_bytes": total_size,
+            },
+            indent=2,
+        )
+    except Exception as e:
+        return f"Error preparing attachments: {e}"
+
 @mcp.tool(name="email_save_attachment", annotations={"title": "Save Email Attachment to Disk", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True})
 async def email_save_attachment(params: SaveAttachmentInput) -> str:
     """Save an email attachment directly to disk. This is the PREFERRED way to\ndownload attachments — it writes the file and returns only the path and metadata,\nkeeping the conversation context clean.\n\nUse email_read_email first to see attachment indices, then call this with the\ndesired index and a full file path (e.g., C:\\Users\\me\\Downloads\\report.pdf on\nWindows or /tmp/report.pdf on Linux).\n"""
@@ -649,9 +738,12 @@ async def email_save_attachment(params: SaveAttachmentInput) -> str:
                     save_dir = os.path.dirname(params.save_path)
                     if save_dir and not os.path.isdir(save_dir):
                         os.makedirs(save_dir, exist_ok=True)
+                    existed_before = os.path.exists(params.save_path)
+                    if existed_before and not params.overwrite:
+                        return f"Error: File already exists at '{params.save_path}'. Re-run with overwrite=true to replace it."
                     with open(params.save_path, "wb") as f:
                         f.write(payload)
-                    return json.dumps({"saved": params.save_path, "filename": filename, "content_type": part.get_content_type(), "size_bytes": len(payload)}, indent=2)
+                    return json.dumps({"saved": params.save_path, "filename": filename, "content_type": part.get_content_type(), "size_bytes": len(payload), "overwritten": existed_before}, indent=2)
             return f"Error: No part found at index {params.attachment_index}."
     except Exception as e:
         return f"Error saving attachment: {e}"
@@ -659,11 +751,9 @@ async def email_save_attachment(params: SaveAttachmentInput) -> str:
 @mcp.tool(name="email_send_email", annotations={"title": "Send Email", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
 async def email_send_email(params: SendEmailInput) -> str:
     """Send an email via SMTP.\n\nIf send_code is configured in accounts.json, a confirmation_code is required.\nShow the user the full draft (to, subject, body) and wait for their code.\n\nFor attachments, ALWAYS use the 'attachments' parameter with full file paths\n(e.g., C:\\Users\\me\\Documents\\file.pdf). Do NOT use attachments_inline (base64)\nunless you have no filesystem access. Ask the user for exact file paths.\n\nAlso supports: HTML body, calendar invites (ICS with Accept/Decline buttons).\nAll sent emails are automatically saved to the Sent folder.\n"""
-    if _send_code:
-        if not params.confirmation_code:
-            return "BLOCKED: A confirmation code is required. Show the draft to the user and ask for their code."
-        if params.confirmation_code.strip() != _send_code.strip():
-            return "BLOCKED: Invalid confirmation code. The email was NOT sent."
+    blocked = _check_confirmation_code(params.confirmation_code)
+    if blocked:
+        return blocked
     try:
         acct = _resolve_account(params.account)
         in_reply_to = references = None
@@ -695,11 +785,9 @@ async def email_send_email(params: SendEmailInput) -> str:
 @mcp.tool(name="email_reply", annotations={"title": "Reply to Email", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
 async def email_reply(params: ReplyEmailInput) -> str:
     """Reply to an email. Automatically sets the recipient to the original sender,\nprefixes the subject with 'Re:', quotes the original body, and sets threading\nheaders (In-Reply-To, References) so the reply appears in the same thread.\n"""
-    if _send_code:
-        if not params.confirmation_code:
-            return "BLOCKED: A confirmation code is required. Show the draft to the user and ask for their code."
-        if params.confirmation_code.strip() != _send_code.strip():
-            return "BLOCKED: Invalid confirmation code. The email was NOT sent."
+    blocked = _check_confirmation_code(params.confirmation_code)
+    if blocked:
+        return blocked
     try:
         acct = _resolve_account(params.account)
         with _imap_session(acct, folder=params.folder) as conn:
@@ -737,11 +825,9 @@ async def email_reply(params: ReplyEmailInput) -> str:
 @mcp.tool(name="email_reply_all", annotations={"title": "Reply All to Email", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
 async def email_reply_all(params: ReplyAllEmailInput) -> str:
     """Reply to all recipients of an email. Sets To to the original sender,\nCC to all other recipients (original To + CC minus yourself), prefixes\nsubject with 'Re:', quotes the original body, and sets threading headers.\n"""
-    if _send_code:
-        if not params.confirmation_code:
-            return "BLOCKED: A confirmation code is required. Show the draft to the user and ask for their code."
-        if params.confirmation_code.strip() != _send_code.strip():
-            return "BLOCKED: Invalid confirmation code. The email was NOT sent."
+    blocked = _check_confirmation_code(params.confirmation_code)
+    if blocked:
+        return blocked
     try:
         acct = _resolve_account(params.account)
         with _imap_session(acct, folder=params.folder) as conn:
@@ -762,12 +848,13 @@ async def email_reply_all(params: ReplyAllEmailInput) -> str:
         _, reply_addr = parseaddr(orig_from)
         my_addr = acct["address"].lower()
         cc_addrs = []
-        for field in [orig_to, orig_cc]:
-            if not field: continue
-            for addr_str in field.split(","):
-                _, addr = parseaddr(addr_str.strip())
-                if addr and addr.lower() != my_addr and addr.lower() != reply_addr.lower():
-                    cc_addrs.append(addr)
+        seen_cc = set()
+        for addr in _parse_address_list(orig_to, orig_cc):
+            normalized = addr.lower()
+            if normalized in (my_addr, reply_addr.lower()) or normalized in seen_cc:
+                continue
+            seen_cc.add(normalized)
+            cc_addrs.append(addr)
         subject = orig_subject if re.match(r'(?i)^Re:\s', orig_subject) else f"Re: {orig_subject}"
         full_body = f"{params.body}\n\n{_quote_body(orig_body, orig_from, orig_date)}"
         full_body_html = None
@@ -790,11 +877,9 @@ async def email_reply_all(params: ReplyAllEmailInput) -> str:
 @mcp.tool(name="email_forward", annotations={"title": "Forward Email", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True})
 async def email_forward(params: ForwardEmailInput) -> str:
     """Forward an email to new recipients. Includes the original body as quoted\ncontent, prefixes subject with 'Fwd:', and optionally carries over all\noriginal attachments.\n"""
-    if _send_code:
-        if not params.confirmation_code:
-            return "BLOCKED: A confirmation code is required. Show the draft to the user and ask for their code."
-        if params.confirmation_code.strip() != _send_code.strip():
-            return "BLOCKED: Invalid confirmation code. The email was NOT sent."
+    blocked = _check_confirmation_code(params.confirmation_code)
+    if blocked:
+        return blocked
     try:
         acct = _resolve_account(params.account)
         with _imap_session(acct, folder=params.folder) as conn:

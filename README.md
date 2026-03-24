@@ -116,6 +116,8 @@ Or if running from source:
 }
 ```
 
+Config is reloaded on each tool call, so changes to `accounts.json` such as rotating `send_code` take effect without restarting the MCP server.
+
 ### Fields
 
 | Field | Required | Description |
@@ -154,6 +156,7 @@ SEND_CODE=optional
 | `email_search_emails` | Search emails using IMAP criteria |
 | `email_read_email` | Read full email content by UID |
 | `email_get_attachment` | Download an attachment as base64 |
+| `email_prepare_attachments` | Inspect local attachment paths before sending |
 | `email_save_attachment` | Save an attachment directly to disk (preferred for large files) |
 | `email_send_email` | Send an email (text, HTML, attachments, calendar invites) |
 | `email_reply` | Reply to an email (auto-sets recipient, subject, threading, quotes body) |
@@ -163,6 +166,12 @@ SEND_CODE=optional
 | `email_mark_email` | Mark as read/unread/flagged/unflagged |
 
 ### Sending with attachments
+
+**Preflight metadata only** (recommended before send):
+```json
+attachments: "/path/to/file.pdf, /path/to/doc.xlsx"
+```
+Call `email_prepare_attachments` first to verify resolved paths, file names, sizes, MIME types, and missing files without loading contents into context.
 
 **File path** (when the MCP server has filesystem access):
 ```
@@ -184,14 +193,25 @@ calendar_ics: "BEGIN:VCALENDAR\r\nVERSION:2.0\r\n..."
 
 ### Send confirmation gate
 
-If `send_code` is set in `accounts.json`, the AI must show the email draft to the user and wait for them to provide the code before sending. This prevents accidental sends. Remove or clear `send_code` to disable.
+If `send_code` is set in `accounts.json`, the AI must show the email draft to the user and wait for them to provide the code before sending. This is useful as a workflow checkpoint to reduce accidental sends.
+
+Important: this is not a hard security boundary if the MCP process and the AI runtime can both read the same config source. In that setup, the AI may be able to read the code from `accounts.json` or environment variables. Remove or clear `send_code` to disable the checkpoint.
+
+## Testing
+
+Run the regression suite from the repo root:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## Security
 
 - Passwords are stored in `accounts.json` — **add it to `.gitignore`**
-- The `send_code` gate prevents the AI from sending emails without user approval
+- The `send_code` gate is a user-intent checkpoint, not a hard secret, unless the AI cannot read the config source that contains it
 - No passwords are exposed via the `email_list_accounts` tool
 - **File attachments**: The `attachments` parameter reads files from paths the AI provides. If the MCP server runs with broad filesystem access, the AI could theoretically attach and send any readable file. Use `attachments_inline` (base64) in sandboxed environments, or restrict filesystem access at the OS/container level.
+- **Saving attachments**: `email_save_attachment` now fails if the target file already exists unless `overwrite=true` is set explicitly.
 
 ## Provider Notes
 
