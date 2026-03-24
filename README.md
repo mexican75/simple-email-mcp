@@ -122,8 +122,9 @@ Or if running from source:
 |-------|----------|-------------|
 | `send_code` | No | If set, users must provide this code to send emails. Omit or set to `""` to disable. |
 | `name` | Yes | Short identifier for the account (used in tool calls) |
-| `address` | Yes | Email address |
+| `address` | Yes | Email address (used for IMAP/SMTP login) |
 | `password` | Yes | Password or app-specific password |
+| `send_as` | No | Alias address to use as the `From` header and envelope sender. Defaults to `address`. The alias must be authorized by your email provider. |
 | `provider` | No | Preset: `gmail`, `outlook`, `purelymail`, `domainfactory` |
 | `imap_host` | No | Custom IMAP server (overrides provider default) |
 | `imap_port` | No | Custom IMAP port (default: 993) |
@@ -141,6 +142,7 @@ EMAIL_PASSWORD=password
 IMAP_HOST=imap.example.com
 SMTP_HOST=smtp.example.com
 SMTP_SECURITY=ssl
+SEND_AS=alias@example.com
 SEND_CODE=optional
 ```
 

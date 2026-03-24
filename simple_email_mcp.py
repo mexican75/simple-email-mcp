@@ -14,7 +14,8 @@ Configuration via accounts.json:
       "name": "my-account",
       "address": "me@example.com",
       "password": "app-password",
-      "provider": "purelymail"
+      "provider": "purelymail",
+      "send_as": "alias@example.com"
     }
   ]
 }
@@ -60,8 +61,10 @@ def _load_accounts() -> None:
             defaults = PROVIDER_DEFAULTS.get(provider, {})
             smtp_port = acct.get("smtp_port", defaults.get("smtp_port", 465))
             smtp_security = acct.get("smtp_security", defaults.get("smtp_security", "starttls" if smtp_port == 587 else "ssl"))
+            address = acct["address"]
             _accounts[name] = {
-                "address": acct["address"], "password": acct["password"],
+                "address": address, "password": acct["password"],
+                "send_as": acct.get("send_as", address),
                 "imap_host": acct.get("imap_host", defaults.get("imap_host", "imap.example.com")),
                 "imap_port": acct.get("imap_port", defaults.get("imap_port", 993)),
                 "smtp_host": acct.get("smtp_host", defaults.get("smtp_host", "smtp.example.com")),
@@ -76,6 +79,7 @@ def _load_accounts() -> None:
         smtp_port = int(os.environ.get("SMTP_PORT", "465"))
         _accounts["default"] = {
             "address": addr, "password": pwd,
+            "send_as": os.environ.get("SEND_AS", addr),
             "imap_host": os.environ.get("IMAP_HOST", "imap.example.com"),
             "imap_port": int(os.environ.get("IMAP_PORT", "993")),
             "smtp_host": os.environ.get("SMTP_HOST", "smtp.example.com"),
@@ -84,6 +88,10 @@ def _load_accounts() -> None:
         }
 
 _load_accounts()
+
+def _sender_address(acct: Dict[str, Any]) -> str:
+    """Returns the send_as alias if configured, otherwise the login address."""
+    return acct.get("send_as", acct["address"])
 
 def _resolve_account(account: Optional[str]) -> Dict[str, Any]:
     if not _accounts:
@@ -295,11 +303,12 @@ def _compose_and_send(
         mime.attach(body_part)
     else:
         mime = body_part
-    mime["From"] = acct["address"]
+    sender = _sender_address(acct)
+    mime["From"] = sender
     mime["To"] = to
     mime["Subject"] = subject
     mime["Date"] = formatdate(localtime=True)
-    mime["Message-ID"] = make_msgid(domain=acct["address"].split("@")[1])
+    mime["Message-ID"] = make_msgid(domain=sender.split("@")[1])
     if cc: mime["Cc"] = cc
     if in_reply_to: mime["In-Reply-To"] = in_reply_to
     if references: mime["References"] = references
@@ -342,9 +351,9 @@ def _compose_and_send(
     if cc: recipients += [a.strip() for a in cc.split(",")]
     if bcc: recipients += [a.strip() for a in bcc.split(",")]
     mime_str = mime.as_string()
-    _smtp_send(acct, acct["address"], recipients, mime_str)
+    _smtp_send(acct, sender, recipients, mime_str)
     sent_warning = _save_to_sent(acct, mime_str)
-    result = {"status": "sent", "from": acct["address"], "to": to, "subject": subject}
+    result = {"status": "sent", "from": sender, "to": to, "subject": subject}
     if cc: result["cc"] = cc
     if bcc: result["bcc"] = bcc
     if sent_warning: result["warning"] = sent_warning
@@ -750,13 +759,13 @@ async def email_reply_all(params: ReplyAllEmailInput) -> str:
         orig_body = _extract_body(orig)
         orig_msg_id = orig.get("Message-ID", "")
         _, reply_addr = parseaddr(orig_from)
-        my_addr = acct["address"].lower()
+        my_addrs = {acct["address"].lower(), _sender_address(acct).lower()}
         cc_addrs = []
         for field in [orig_to, orig_cc]:
             if not field: continue
             for addr_str in field.split(","):
                 _, addr = parseaddr(addr_str.strip())
-                if addr and addr.lower() != my_addr and addr.lower() != reply_addr.lower():
+                if addr and addr.lower() not in my_addrs and addr.lower() != reply_addr.lower():
                     cc_addrs.append(addr)
         subject = orig_subject if re.match(r'(?i)^Re:\s', orig_subject) else f"Re: {orig_subject}"
         full_body = f"{params.body}\n\n{_quote_body(orig_body, orig_from, orig_date)}"
