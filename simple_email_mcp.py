@@ -45,6 +45,12 @@ _accounts: Dict[str, Dict[str, Any]] = {}
 _send_code: Optional[str] = None
 _sent_folder_cache: Dict[str, str] = {}
 
+def _int_config(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 def _load_accounts() -> None:
     global _accounts, _send_code, _sent_folder_cache
     _accounts = {}
@@ -52,15 +58,22 @@ def _load_accounts() -> None:
     _sent_folder_cache = {}
     config_path = os.environ.get("ACCOUNTS_FILE", str(Path(__file__).parent / "accounts.json"))
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            raw = json.load(f)
+        try:
+            with open(config_path, "r") as f:
+                raw = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(raw, dict):
+            return
         code = raw.get("send_code", "")
         _send_code = code if code else None
         for acct in raw.get("accounts", []):
+            if not isinstance(acct, dict) or not all(acct.get(field) for field in ("name", "address", "password")):
+                continue
             name = acct["name"]
             provider = acct.get("provider", "")
             defaults = PROVIDER_DEFAULTS.get(provider, {})
-            smtp_port = acct.get("smtp_port", defaults.get("smtp_port", 465))
+            smtp_port = _int_config(acct.get("smtp_port", defaults.get("smtp_port", 465)), 465)
             smtp_security = acct.get("smtp_security", defaults.get("smtp_security", "starttls" if smtp_port == 587 else "ssl"))
             address = acct["address"]
             _accounts[name] = {
@@ -69,7 +82,7 @@ def _load_accounts() -> None:
                 "display_name": acct.get("display_name") or acct.get("from_name") or "",
                 "description": acct.get("description") or "",
                 "imap_host": acct.get("imap_host", defaults.get("imap_host", "imap.example.com")),
-                "imap_port": acct.get("imap_port", defaults.get("imap_port", 993)),
+                "imap_port": _int_config(acct.get("imap_port", defaults.get("imap_port", 993)), 993),
                 "smtp_host": acct.get("smtp_host", defaults.get("smtp_host", "smtp.example.com")),
                 "smtp_port": smtp_port,
                 "smtp_security": smtp_security,
@@ -79,14 +92,14 @@ def _load_accounts() -> None:
     addr = os.environ.get("EMAIL_ADDRESS", "")
     pwd = os.environ.get("EMAIL_PASSWORD", "")
     if addr and pwd:
-        smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+        smtp_port = _int_config(os.environ.get("SMTP_PORT", "465"), 465)
         _accounts["default"] = {
             "address": addr, "password": pwd,
             "send_as": os.environ.get("SEND_AS", addr),
             "display_name": os.environ.get("EMAIL_DISPLAY_NAME", ""),
             "description": os.environ.get("EMAIL_DESCRIPTION", ""),
             "imap_host": os.environ.get("IMAP_HOST", "imap.example.com"),
-            "imap_port": int(os.environ.get("IMAP_PORT", "993")),
+            "imap_port": _int_config(os.environ.get("IMAP_PORT", "993"), 993),
             "smtp_host": os.environ.get("SMTP_HOST", "smtp.example.com"),
             "smtp_port": smtp_port,
             "smtp_security": os.environ.get("SMTP_SECURITY", "starttls" if smtp_port == 587 else "ssl"),
@@ -105,6 +118,162 @@ def _check_confirmation_code(confirmation_code: Optional[str]) -> Optional[str]:
         if confirmation_code.strip() != _send_code.strip():
             return "BLOCKED: Invalid confirmation code. The email was NOT sent."
     return None
+
+def _looks_like_email(value: str) -> bool:
+    _, addr = parseaddr(value or "")
+    return bool(addr and "@" in addr and "." in addr.rsplit("@", 1)[-1])
+
+def _coerce_port(value: Any, field: str, account_label: str, errors: list[str]) -> Optional[int]:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        errors.append(f"{account_label}: {field} must be an integer.")
+        return None
+    if not 1 <= port <= 65535:
+        errors.append(f"{account_label}: {field} must be between 1 and 65535.")
+        return None
+    return port
+
+def _validate_account_record(acct: Dict[str, Any], index: int, seen_names: set[str], errors: list[str], warnings: list[str]) -> Optional[dict]:
+    label = f"accounts[{index}]"
+    if not isinstance(acct, dict):
+        errors.append(f"{label}: account must be an object.")
+        return None
+
+    name = str(acct.get("name", "")).strip()
+    account_label = name or label
+    if not name:
+        errors.append(f"{label}: missing required field 'name'.")
+    elif name.lower() in seen_names:
+        errors.append(f"{account_label}: duplicate account name.")
+    else:
+        seen_names.add(name.lower())
+
+    address = str(acct.get("address", "")).strip()
+    if not address:
+        errors.append(f"{account_label}: missing required field 'address'.")
+    elif not _looks_like_email(address):
+        errors.append(f"{account_label}: address does not look like an email address.")
+
+    if not str(acct.get("password", "")).strip():
+        errors.append(f"{account_label}: missing required field 'password'.")
+
+    send_as = str(acct.get("send_as") or address).strip()
+    if send_as and not _looks_like_email(send_as):
+        errors.append(f"{account_label}: send_as does not look like an email address.")
+
+    provider = str(acct.get("provider", "")).strip()
+    defaults = PROVIDER_DEFAULTS.get(provider, {})
+    if provider and provider not in PROVIDER_DEFAULTS:
+        warnings.append(f"{account_label}: unknown provider '{provider}', using explicit host/port values or placeholders.")
+
+    imap_host = str(acct.get("imap_host", defaults.get("imap_host", "imap.example.com"))).strip()
+    smtp_host = str(acct.get("smtp_host", defaults.get("smtp_host", "smtp.example.com"))).strip()
+    if not imap_host:
+        errors.append(f"{account_label}: imap_host is empty.")
+    if not smtp_host:
+        errors.append(f"{account_label}: smtp_host is empty.")
+    if not provider and imap_host == "imap.example.com":
+        warnings.append(f"{account_label}: no provider or imap_host configured; IMAP will use placeholder host.")
+    if not provider and smtp_host == "smtp.example.com":
+        warnings.append(f"{account_label}: no provider or smtp_host configured; SMTP will use placeholder host.")
+
+    imap_port = _coerce_port(acct.get("imap_port", defaults.get("imap_port", 993)), "imap_port", account_label, errors)
+    smtp_port = _coerce_port(acct.get("smtp_port", defaults.get("smtp_port", 465)), "smtp_port", account_label, errors)
+
+    smtp_security = str(acct.get("smtp_security", defaults.get("smtp_security", "starttls" if smtp_port == 587 else "ssl"))).strip().lower()
+    if smtp_security not in {"ssl", "starttls"}:
+        errors.append(f"{account_label}: smtp_security must be 'ssl' or 'starttls'.")
+
+    summary = {
+        "name": name,
+        "address": address,
+        "send_as": send_as or address,
+        "provider": provider or None,
+        "imap_host": imap_host,
+        "imap_port": imap_port,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "smtp_security": smtp_security,
+        "password_configured": bool(str(acct.get("password", "")).strip()),
+    }
+    if acct.get("display_name") or acct.get("from_name"):
+        summary["display_name"] = acct.get("display_name") or acct.get("from_name")
+    if acct.get("description"):
+        summary["description"] = acct.get("description")
+    return summary
+
+def _validate_config() -> dict:
+    errors: list[str] = []
+    warnings: list[str] = []
+    config_path = os.environ.get("ACCOUNTS_FILE", str(Path(__file__).parent / "accounts.json"))
+
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                raw = json.load(f)
+        except json.JSONDecodeError as e:
+            return {"ok": False, "source": "accounts_file", "config_path": config_path, "errors": [f"Invalid JSON: {e}"], "warnings": [], "accounts": []}
+        except OSError as e:
+            return {"ok": False, "source": "accounts_file", "config_path": config_path, "errors": [f"Could not read config file: {e}"], "warnings": [], "accounts": []}
+
+        if not isinstance(raw, dict):
+            return {"ok": False, "source": "accounts_file", "config_path": config_path, "errors": ["Config root must be an object."], "warnings": [], "accounts": []}
+
+        raw_accounts = raw.get("accounts", [])
+        if not isinstance(raw_accounts, list):
+            errors.append("'accounts' must be a list.")
+            raw_accounts = []
+        if not raw_accounts:
+            errors.append("No accounts configured.")
+
+        seen_names: set[str] = set()
+        accounts = []
+        for index, acct in enumerate(raw_accounts):
+            summary = _validate_account_record(acct, index, seen_names, errors, warnings)
+            if summary:
+                accounts.append(summary)
+
+        return {
+            "ok": not errors,
+            "source": "accounts_file",
+            "config_path": config_path,
+            "send_code_configured": bool(raw.get("send_code")),
+            "accounts": accounts,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    addr = os.environ.get("EMAIL_ADDRESS", "")
+    pwd = os.environ.get("EMAIL_PASSWORD", "")
+    smtp_port = os.environ.get("SMTP_PORT", "465")
+    env_account = {
+        "name": "default",
+        "address": addr,
+        "password": pwd,
+        "send_as": os.environ.get("SEND_AS", addr),
+        "display_name": os.environ.get("EMAIL_DISPLAY_NAME", ""),
+        "description": os.environ.get("EMAIL_DESCRIPTION", ""),
+        "imap_host": os.environ.get("IMAP_HOST", "imap.example.com"),
+        "imap_port": os.environ.get("IMAP_PORT", "993"),
+        "smtp_host": os.environ.get("SMTP_HOST", "smtp.example.com"),
+        "smtp_port": smtp_port,
+        "smtp_security": os.environ.get("SMTP_SECURITY", "starttls" if smtp_port == "587" else "ssl"),
+    }
+    if not addr and not pwd:
+        errors.append("No accounts.json found and EMAIL_ADDRESS/EMAIL_PASSWORD are not configured.")
+
+    seen_names: set[str] = set()
+    summary = _validate_account_record(env_account, 0, seen_names, errors, warnings)
+    return {
+        "ok": not errors,
+        "source": "environment",
+        "config_path": config_path,
+        "send_code_configured": bool(os.environ.get("SEND_CODE")),
+        "accounts": [summary] if summary else [],
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 def _resolve_account(account: Optional[str]) -> Dict[str, Any]:
     _refresh_runtime_config()
@@ -442,6 +611,7 @@ def _compose_and_send(
 
 # ─── Action schemas for lazy discovery ──────────────────────────────────────
 ACTION_SCHEMAS: Dict[str, Any] = {
+    "validate_config":    {"description": "Validate accounts.json or environment configuration without logging into IMAP/SMTP.", "params": {}},
     "list_accounts":      {"description": "List configured email accounts.", "params": {}},
     "list_folders":       {"description": "List IMAP folders.", "params": {"account": "str, optional"}},
     "list_emails":        {"description": "List recent emails.", "params": {"account": "str, optional", "folder": "str, default=INBOX", "limit": "int, default=20, max=100"}},
@@ -477,6 +647,9 @@ async def _do_list_accounts() -> str:
         if cfg.get("description"): info["description"] = cfg["description"]
         accounts_info.append(info)
     return json.dumps({"accounts": accounts_info, "count": len(accounts_info)}, indent=2)
+
+async def _do_validate_config() -> str:
+    return json.dumps(_validate_config(), indent=2)
 
 async def _do_list_folders(account: Optional[str] = None) -> str:
     try:
@@ -808,13 +981,15 @@ async def _do_prepare_attachments(attachments: str) -> str:
 
 @mcp.tool(name="email")
 async def email_dispatcher(action: str, params: Optional[Dict[str, Any]] = None) -> str:
-    """Email client (IMAP/SMTP). Call with just action to discover its parameters. Actions: list_accounts, list_folders, list_emails, search, read, send, reply, reply_all, forward, move, mark, save_attachment, get_attachment, prepare_attachments."""
+    """Email client (IMAP/SMTP). Call with just action to discover its parameters. Actions: validate_config, list_accounts, list_folders, list_emails, search, read, send, reply, reply_all, forward, move, mark, save_attachment, get_attachment, prepare_attachments."""
     if params is None:
         if action not in ACTION_SCHEMAS:
             return json.dumps({"error": f"Unknown action '{action}'", "available_actions": list(ACTION_SCHEMAS.keys())})
         return json.dumps({"action": action, **ACTION_SCHEMAS[action]})
     p = params
-    if action == "list_accounts":
+    if action == "validate_config":
+        return await _do_validate_config()
+    elif action == "list_accounts":
         return await _do_list_accounts()
     elif action == "list_folders":
         return await _do_list_folders(p.get("account"))

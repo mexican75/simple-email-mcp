@@ -178,6 +178,7 @@ Version 2 exposes a single MCP tool named `email`. Call it with only an `action`
 
 | Action | Description |
 |--------|-------------|
+| `validate_config` | Validate config without logging into IMAP/SMTP |
 | `list_accounts` | List configured accounts |
 | `list_folders` | List IMAP folders for an account |
 | `list_emails` | List recent emails in a folder |
@@ -194,6 +195,32 @@ Version 2 exposes a single MCP tool named `email`. Call it with only an `action`
 | `mark` | Mark as read/unread/flagged/unflagged |
 
 `list_accounts` returns the exact account names plus any configured `send_as`, `display_name`, and `description`, so clients can use the explicit account token instead of guessing partial matches.
+
+### Configuration validation
+
+Use `validate_config` after editing `accounts.json` or environment variables. It checks required fields, email-like addresses, ports, SMTP security, providers, and placeholder hosts without exposing passwords or logging into IMAP/SMTP.
+
+```json
+{
+  "action": "validate_config",
+  "params": {}
+}
+```
+
+### Migrating from v1
+
+Most users do not need to change their MCP client configuration. Keep the same `simple-email-mcp` command and restart the client after upgrading.
+
+The breaking change only affects clients or scripts that call exact v1 tool names such as `email_send_email` or `email_read_email`. In v2, use the single `email` tool with an action instead:
+
+| v1 tool | v2 action |
+|---------|-----------|
+| `email_list_accounts` | `email` with `action: "list_accounts"` |
+| `email_send_email` | `email` with `action: "send"` |
+| `email_read_email` | `email` with `action: "read"` |
+| `email_search_emails` | `email` with `action: "search"` |
+| `email_forward` | `email` with `action: "forward"` |
+| `email_reply_all` | `email` with `action: "reply_all"` |
 
 ### Sending with attachments
 

@@ -372,6 +372,76 @@ class RuntimeConfigReloadTests(unittest.TestCase):
         self.assertIn('"status": "sent"', fresh_code_attempt)
 
 
+class ConfigValidationTests(unittest.TestCase):
+    def test_validate_config_reports_safe_account_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "send_code": "code",
+                        "accounts": [
+                            {
+                                "name": "work",
+                                "address": "login@example.com",
+                                "send_as": "alias@example.com",
+                                "display_name": "Work Sender",
+                                "description": "Work mailbox",
+                                "password": "secret",
+                                "provider": "purelymail",
+                            }
+                        ],
+                    }
+                )
+            )
+
+            with mock.patch.dict("os.environ", {"ACCOUNTS_FILE": str(config_path)}, clear=False):
+                mod = load_module()
+                result = json.loads(asyncio.run(mod.email_dispatcher("validate_config", {})))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "accounts_file")
+        self.assertTrue(result["send_code_configured"])
+        self.assertEqual(result["accounts"][0]["name"], "work")
+        self.assertEqual(result["accounts"][0]["send_as"], "alias@example.com")
+        self.assertTrue(result["accounts"][0]["password_configured"])
+        self.assertNotIn("password", result["accounts"][0])
+
+    def test_validate_config_reports_missing_required_fields(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            config_path.write_text(json.dumps({"accounts": [{"name": "broken"}]}))
+
+            with mock.patch.dict("os.environ", {"ACCOUNTS_FILE": str(config_path)}, clear=False):
+                mod = load_module()
+                result = mod._validate_config()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("address" in error for error in result["errors"]))
+        self.assertTrue(any("password" in error for error in result["errors"]))
+
+    def test_validate_config_checks_environment_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_config = Path(tmpdir) / "missing.json"
+            env = {
+                "ACCOUNTS_FILE": str(missing_config),
+                "EMAIL_ADDRESS": "login@example.com",
+                "EMAIL_PASSWORD": "secret",
+                "SEND_AS": "alias@example.com",
+                "IMAP_HOST": "imap.example.com",
+                "SMTP_HOST": "smtp.example.com",
+            }
+
+            with mock.patch.dict("os.environ", env, clear=False):
+                mod = load_module()
+                result = mod._validate_config()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "environment")
+        self.assertEqual(result["accounts"][0]["name"], "default")
+        self.assertEqual(result["accounts"][0]["send_as"], "alias@example.com")
+
+
 class SendAsTests(unittest.TestCase):
     def test_compose_and_send_uses_send_as_for_headers_envelope_and_result(self):
         mod = load_module()

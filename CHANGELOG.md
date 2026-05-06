@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.0
+
+### Added
+
+- Added `validate_config` action to check `accounts.json` or environment configuration without logging into IMAP/SMTP.
+- Added v1-to-v2 migration notes for clients with hardcoded old tool names.
+
 ## 2.0.0
 
 ### Changed
