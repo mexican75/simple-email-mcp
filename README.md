@@ -15,6 +15,7 @@ Built for [Claude Desktop](https://claude.ai), [Claude Code](https://claude.com/
 - **Save to Sent** — automatically saves sent emails to the Sent folder via IMAP
 - **Optional send gate** — configurable confirmation code to prevent accidental sends
 - **International folders** — handles UTF-7 encoded folder names (German, etc.)
+- **Compact MCP surface** — one `email` tool with lazy action discovery to reduce client context use
 
 ## Quick Start
 
@@ -93,6 +94,9 @@ Or if running from source:
     {
       "name": "work",
       "address": "me@company.com",
+      "send_as": "alias@company.com",
+      "display_name": "Jane Doe",
+      "description": "Primary work mailbox",
       "password": "app-password",
       "provider": "outlook"
     },
@@ -124,7 +128,10 @@ Config is reloaded on each tool call, so changes to `accounts.json` such as rota
 |-------|----------|-------------|
 | `send_code` | No | If set, users must provide this code to send emails. Omit or set to `""` to disable. |
 | `name` | Yes | Short identifier for the account (used in tool calls) |
-| `address` | Yes | Email address |
+| `address` | Yes | Email address used for IMAP/SMTP login |
+| `send_as` | No | Alias address to use as the `From` address, SMTP envelope sender, and Message-ID domain. Defaults to `address`. The alias must be authorized by your email provider. |
+| `display_name` / `from_name` | No | Friendly sender name used in the `From` header, e.g. `Jane Doe <alias@example.com>` |
+| `description` | No | Human-readable label shown by the `list_accounts` action to help clients choose the right mailbox |
 | `password` | Yes | Password or app-specific password |
 | `provider` | No | Preset: `gmail`, `outlook`, `purelymail`, `domainfactory` |
 | `imap_host` | No | Custom IMAP server (overrides provider default) |
@@ -143,27 +150,50 @@ EMAIL_PASSWORD=password
 IMAP_HOST=imap.example.com
 SMTP_HOST=smtp.example.com
 SMTP_SECURITY=ssl
+SEND_AS=alias@example.com
+EMAIL_DISPLAY_NAME="Jane Doe"
+EMAIL_DESCRIPTION="Primary mailbox"
 SEND_CODE=optional
 ```
 
 ## Tools
 
-| Tool | Description |
-|------|-------------|
-| `email_list_accounts` | List configured accounts |
-| `email_list_folders` | List IMAP folders for an account |
-| `email_list_emails` | List recent emails in a folder |
-| `email_search_emails` | Search emails using IMAP criteria |
-| `email_read_email` | Read full email content by UID |
-| `email_get_attachment` | Download an attachment as base64 |
-| `email_prepare_attachments` | Inspect local attachment paths before sending |
-| `email_save_attachment` | Save an attachment directly to disk (preferred for large files) |
-| `email_send_email` | Send an email (text, HTML, attachments, calendar invites) |
-| `email_reply` | Reply to an email (auto-sets recipient, subject, threading, quotes body) |
-| `email_reply_all` | Reply all (sender → To, other recipients → CC, quotes body) |
-| `email_forward` | Forward an email with original attachments |
-| `email_move_email` | Move an email between folders |
-| `email_mark_email` | Mark as read/unread/flagged/unflagged |
+Version 2 exposes a single MCP tool named `email`. Call it with only an `action` to discover that action's parameters, then call it again with `params`.
+
+```json
+{"action": "send"}
+```
+
+```json
+{
+  "action": "send",
+  "params": {
+    "account": "work",
+    "to": "recipient@example.com",
+    "subject": "Hello",
+    "body": "Message body"
+  }
+}
+```
+
+| Action | Description |
+|--------|-------------|
+| `list_accounts` | List configured accounts |
+| `list_folders` | List IMAP folders for an account |
+| `list_emails` | List recent emails in a folder |
+| `search` | Search emails using IMAP criteria |
+| `read` | Read full email content by UID |
+| `get_attachment` | Download an attachment as base64 |
+| `prepare_attachments` | Inspect local attachment paths before sending |
+| `save_attachment` | Save an attachment directly to disk (preferred for large files) |
+| `send` | Send an email (text, HTML, attachments, calendar invites) |
+| `reply` | Reply to an email (auto-sets recipient, subject, threading, quotes body) |
+| `reply_all` | Reply all (sender to To, other recipients to CC, quotes body) |
+| `forward` | Forward an email with original attachments |
+| `move` | Move an email between folders |
+| `mark` | Mark as read/unread/flagged/unflagged |
+
+`list_accounts` returns the exact account names plus any configured `send_as`, `display_name`, and `description`, so clients can use the explicit account token instead of guessing partial matches.
 
 ### Sending with attachments
 
@@ -171,7 +201,7 @@ SEND_CODE=optional
 ```json
 attachments: "/path/to/file.pdf, /path/to/doc.xlsx"
 ```
-Call `email_prepare_attachments` first to verify resolved paths, file names, sizes, MIME types, and missing files without loading contents into context.
+Call `prepare_attachments` first to verify resolved paths, file names, sizes, MIME types, and missing files without loading contents into context.
 
 **File path** (when the MCP server has filesystem access):
 ```
@@ -209,9 +239,9 @@ Run the regression suite from the repo root:
 
 - Passwords are stored in `accounts.json` — **add it to `.gitignore`**
 - The `send_code` gate is a user-intent checkpoint, not a hard secret, unless the AI cannot read the config source that contains it
-- No passwords are exposed via the `email_list_accounts` tool
+- No passwords are exposed via the `list_accounts` action
 - **File attachments**: The `attachments` parameter reads files from paths the AI provides. If the MCP server runs with broad filesystem access, the AI could theoretically attach and send any readable file. Use `attachments_inline` (base64) in sandboxed environments, or restrict filesystem access at the OS/container level.
-- **Saving attachments**: `email_save_attachment` now fails if the target file already exists unless `overwrite=true` is set explicitly.
+- **Saving attachments**: `save_attachment` fails if the target file already exists unless `overwrite=true` is set explicitly.
 
 ## Provider Notes
 

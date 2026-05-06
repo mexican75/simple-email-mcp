@@ -10,6 +10,9 @@
     {
       "name": "work",
       "address": "me@company.com",
+      "send_as": "alias@company.com",
+      "display_name": "Jane Doe",
+      "description": "Primary work mailbox",
       "password": "your-app-password",
       "provider": "outlook"
     },

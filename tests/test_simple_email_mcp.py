@@ -34,6 +34,22 @@ class ResolveAccountTests(unittest.TestCase):
             resolved = mod._resolve_account("sender@example.com")
         self.assertEqual(resolved["address"], "Sender@Example.com")
 
+    def test_format_from_header_uses_display_name_when_present(self):
+        mod = load_module()
+        header = mod._format_from_header({"address": "sender@example.com", "display_name": "Sender Name"})
+        self.assertEqual(header, "Sender Name <sender@example.com>")
+
+    def test_format_from_header_uses_send_as_with_display_name(self):
+        mod = load_module()
+        header = mod._format_from_header(
+            {
+                "address": "login@example.com",
+                "send_as": "alias@example.com",
+                "display_name": "Sender Name",
+            }
+        )
+        self.assertEqual(header, "Sender Name <alias@example.com>")
+
     def test_ambiguous_partial_match_fails_closed(self):
         mod = load_module()
         with mock.patch.dict(
@@ -66,13 +82,13 @@ class ImapSessionTests(unittest.TestCase):
 
 
 class ReplyAllTests(unittest.TestCase):
-    def test_reply_all_uses_rfc_aware_address_parsing(self):
+    def test_reply_all_uses_rfc_aware_address_parsing_and_excludes_alias(self):
         mod = load_module()
         original = email.message_from_string(
             "\n".join(
                 [
                     'From: "Support" <support@example.com>',
-                    'To: "Doe, John" <john@example.com>, Jane <jane@example.com>',
+                    'To: "Doe, John" <john@example.com>, Jane <jane@example.com>, Alias <alias@example.com>',
                     'Cc: "Smith, Ann" <ann@example.com>, Me <me@example.com>',
                     "Subject: Status Update",
                     "Date: Tue, 24 Mar 2026 09:00:00 +0000",
@@ -103,13 +119,12 @@ class ReplyAllTests(unittest.TestCase):
             captured["subject"] = subject
             return {"status": "sent"}
 
-        with mock.patch.dict(mod._accounts, {"default": {"address": "me@example.com"}}, clear=True), \
+        with mock.patch.dict(mod._accounts, {"default": {"address": "me@example.com", "send_as": "alias@example.com"}}, clear=True), \
              mock.patch.object(mod, "_refresh_runtime_config"), \
              mock.patch.object(mod, "_send_code", None), \
              mock.patch.object(mod, "_imap_session", fake_imap_session), \
              mock.patch.object(mod, "_compose_and_send", side_effect=fake_compose_and_send):
-            params = mod.ReplyAllEmailInput(uid="123", folder="INBOX", body="Thanks")
-            result = asyncio.run(mod.email_reply_all(params))
+            result = asyncio.run(mod._do_reply_all({"uid": "123", "folder": "INBOX", "body": "Thanks"}))
 
         self.assertIn('"status": "sent"', result)
         self.assertEqual(captured["to"], "support@example.com")
@@ -125,8 +140,7 @@ class AttachmentWorkflowTests(unittest.TestCase):
             existing.write_text("hello")
             missing = Path(tmpdir) / "missing.pdf"
 
-            params = mod.PrepareAttachmentsInput(attachments=f"{existing}, {missing}")
-            result = json.loads(asyncio.run(mod.email_prepare_attachments(params)))
+            result = json.loads(asyncio.run(mod._do_prepare_attachments(f"{existing}, {missing}")))
 
         self.assertEqual(result["count"], 2)
         self.assertEqual(result["existing_count"], 1)
@@ -181,13 +195,31 @@ class AttachmentWorkflowTests(unittest.TestCase):
             with mock.patch.dict(mod._accounts, {"default": {"address": "me@example.com"}}, clear=True), \
                  mock.patch.object(mod, "_refresh_runtime_config"), \
                  mock.patch.object(mod, "_imap_session", fake_imap_session):
-                params = mod.SaveAttachmentInput(uid="1", attachment_index=2, save_path=str(destination))
-                blocked = asyncio.run(mod.email_save_attachment(params))
+                blocked = asyncio.run(
+                    mod._do_save_attachment(
+                        account=None,
+                        uid="1",
+                        folder="INBOX",
+                        attachment_index=2,
+                        save_path=str(destination),
+                        overwrite=False,
+                    )
+                )
                 self.assertIn("overwrite=true", blocked)
                 self.assertEqual(destination.read_text(), "old")
 
-                overwrite_params = mod.SaveAttachmentInput(uid="1", attachment_index=2, save_path=str(destination), overwrite=True)
-                saved = json.loads(asyncio.run(mod.email_save_attachment(overwrite_params)))
+                saved = json.loads(
+                    asyncio.run(
+                        mod._do_save_attachment(
+                            account=None,
+                            uid="1",
+                            folder="INBOX",
+                            attachment_index=2,
+                            save_path=str(destination),
+                            overwrite=True,
+                        )
+                    )
+                )
 
             self.assertEqual(destination.read_text(), "hello")
             self.assertTrue(saved["overwritten"])
@@ -210,7 +242,7 @@ class RuntimeConfigReloadTests(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"ACCOUNTS_FILE": str(config_path)}, clear=False):
                 mod = load_module()
-                first = json.loads(asyncio.run(mod.email_list_accounts(mod.ListAccountsInput())))
+                first = json.loads(asyncio.run(mod._do_list_accounts()))
 
                 config_path.write_text(
                     json.dumps(
@@ -221,10 +253,54 @@ class RuntimeConfigReloadTests(unittest.TestCase):
                         }
                     )
                 )
-                second = json.loads(asyncio.run(mod.email_list_accounts(mod.ListAccountsInput())))
+                second = json.loads(asyncio.run(mod._do_list_accounts()))
 
         self.assertEqual(first["accounts"][0]["name"], "alpha")
         self.assertEqual(second["accounts"][0]["name"], "beta")
+
+    def test_list_accounts_includes_display_name_and_description(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "accounts.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "accounts": [
+                            {
+                                "name": "alpha",
+                                "address": "alpha@example.com",
+                                "password": "one",
+                                "send_as": "alias@example.com",
+                                "display_name": "Alpha Sender",
+                                "description": "Main personal mailbox",
+                            },
+                        ]
+                    }
+                )
+            )
+
+            with mock.patch.dict("os.environ", {"ACCOUNTS_FILE": str(config_path)}, clear=False):
+                mod = load_module()
+                result = json.loads(asyncio.run(mod._do_list_accounts()))
+
+        self.assertEqual(result["accounts"][0]["display_name"], "Alpha Sender")
+        self.assertEqual(result["accounts"][0]["description"], "Main personal mailbox")
+        self.assertEqual(result["accounts"][0]["send_as"], "alias@example.com")
+
+    def test_env_send_as_applies_to_default_account(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_config = Path(tmpdir) / "missing-accounts.json"
+            env = {
+                "ACCOUNTS_FILE": str(missing_config),
+                "EMAIL_ADDRESS": "login@example.com",
+                "EMAIL_PASSWORD": "secret",
+                "SEND_AS": "alias@example.com",
+            }
+
+            with mock.patch.dict("os.environ", env, clear=False):
+                mod = load_module()
+
+        self.assertEqual(mod._accounts["default"]["address"], "login@example.com")
+        self.assertEqual(mod._accounts["default"]["send_as"], "alias@example.com")
 
     def test_send_code_changes_apply_without_restart(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -245,14 +321,14 @@ class RuntimeConfigReloadTests(unittest.TestCase):
 
                 with mock.patch.object(mod, "_compose_and_send", return_value={"status": "sent"}):
                     first_attempt = asyncio.run(
-                        mod.email_send_email(
-                            mod.SendEmailInput(
-                                confirmation_code="first-code",
-                                account="alpha",
-                                to="dest@example.com",
-                                subject="test",
-                                body="hello",
-                            )
+                        mod._do_send(
+                            {
+                                "confirmation_code": "first-code",
+                                "account": "alpha",
+                                "to": "dest@example.com",
+                                "subject": "test",
+                                "body": "hello",
+                            }
                         )
                     )
 
@@ -268,32 +344,79 @@ class RuntimeConfigReloadTests(unittest.TestCase):
                     )
 
                     stale_code_attempt = asyncio.run(
-                        mod.email_send_email(
-                            mod.SendEmailInput(
-                                confirmation_code="first-code",
-                                account="alpha",
-                                to="dest@example.com",
-                                subject="test",
-                                body="hello",
-                            )
+                        mod._do_send(
+                            {
+                                "confirmation_code": "first-code",
+                                "account": "alpha",
+                                "to": "dest@example.com",
+                                "subject": "test",
+                                "body": "hello",
+                            }
                         )
                     )
 
                     fresh_code_attempt = asyncio.run(
-                        mod.email_send_email(
-                            mod.SendEmailInput(
-                                confirmation_code="second-code",
-                                account="alpha",
-                                to="dest@example.com",
-                                subject="test",
-                                body="hello",
-                            )
+                        mod._do_send(
+                            {
+                                "confirmation_code": "second-code",
+                                "account": "alpha",
+                                "to": "dest@example.com",
+                                "subject": "test",
+                                "body": "hello",
+                            }
                         )
                     )
 
         self.assertIn('"status": "sent"', first_attempt)
         self.assertIn("Invalid confirmation code", stale_code_attempt)
         self.assertIn('"status": "sent"', fresh_code_attempt)
+
+
+class SendAsTests(unittest.TestCase):
+    def test_compose_and_send_uses_send_as_for_headers_envelope_and_result(self):
+        mod = load_module()
+        captured = {}
+
+        def fake_smtp_send(acct, sender, recipients, mime_str):
+            captured["sender"] = sender
+            captured["recipients"] = recipients
+            captured["message"] = email.message_from_string(mime_str)
+
+        acct = {
+            "address": "login@example.com",
+            "send_as": "alias@example.net",
+            "display_name": "Sender Name",
+            "smtp_security": "ssl",
+        }
+
+        with mock.patch.object(mod, "_smtp_send", side_effect=fake_smtp_send), \
+             mock.patch.object(mod, "_save_to_sent", return_value=None):
+            result = mod._compose_and_send(
+                acct,
+                to="dest@example.com",
+                subject="hello",
+                body="body",
+                cc="copy@example.com",
+            )
+
+        self.assertEqual(result["from"], "alias@example.net")
+        self.assertEqual(captured["sender"], "alias@example.net")
+        self.assertEqual(captured["recipients"], ["dest@example.com", "copy@example.com"])
+        self.assertEqual(captured["message"]["From"], "Sender Name <alias@example.net>")
+        self.assertTrue(captured["message"]["Message-ID"].endswith("@example.net>"))
+
+    def test_dispatcher_discovers_and_runs_list_accounts(self):
+        mod = load_module()
+        with mock.patch.dict(
+            mod._accounts,
+            {"default": {"address": "login@example.com", "send_as": "alias@example.com", "imap_host": "imap", "smtp_host": "smtp"}},
+            clear=True,
+        ), mock.patch.object(mod, "_refresh_runtime_config"):
+            schema = json.loads(asyncio.run(mod.email_dispatcher("list_accounts")))
+            result = json.loads(asyncio.run(mod.email_dispatcher("list_accounts", {})))
+
+        self.assertIn("params", schema)
+        self.assertEqual(result["accounts"][0]["send_as"], "alias@example.com")
 
 
 if __name__ == "__main__":
