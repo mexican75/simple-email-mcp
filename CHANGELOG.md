@@ -6,6 +6,7 @@
 
 - Fixed `reply` and `reply_all` for Outlook messages whose display names contain unquoted commas (for example, `Doe, Jane <jane@example.com>`).
 - SMTP envelope recipients are now parsed as RFC address lists instead of being split on commas, preserving quoted display names and rejecting invalid recipients before delivery.
+- Constrained the MCP runtime dependency to compatible 1.x releases; MCP 2.0 removes the FastMCP import used by this server.
 
 ## 2.1.0
 
