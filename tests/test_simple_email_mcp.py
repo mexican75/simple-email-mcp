@@ -131,6 +131,98 @@ class ReplyAllTests(unittest.TestCase):
         self.assertEqual(captured["cc"], "john@example.com, jane@example.com, ann@example.com")
         self.assertEqual(captured["subject"], "Re: Status Update")
 
+    def test_reply_accepts_outlook_unquoted_last_first_display_name(self):
+        mod = load_module()
+        original = email.message_from_string(
+            "\n".join(
+                [
+                    "From: Müller, Lena <lena.mueller@example.com>",
+                    "To: me@example.com",
+                    "Subject: Code of Conduct",
+                    "Message-ID: <orig@example.com>",
+                    "",
+                    "Original body",
+                ]
+            )
+        )
+
+        class FakeConn:
+            def uid(self, command, uid, query):
+                return "OK", [(b"1 (RFC822 {0})", original.as_bytes())]
+
+        @contextlib.contextmanager
+        def fake_imap_session(acct, folder=None, readonly=True):
+            yield FakeConn()
+
+        captured = {}
+
+        def fake_compose_and_send(acct, to, subject, body, **kwargs):
+            captured["to"] = to
+            return {"status": "sent"}
+
+        with mock.patch.dict(mod._accounts, {"default": {"address": "me@example.com"}}, clear=True), \
+             mock.patch.object(mod, "_refresh_runtime_config"), \
+             mock.patch.object(mod, "_send_code", None), \
+             mock.patch.object(mod, "_imap_session", fake_imap_session), \
+             mock.patch.object(mod, "_compose_and_send", side_effect=fake_compose_and_send):
+            result = asyncio.run(mod._do_reply({"uid": "123", "folder": "INBOX", "body": "Thanks"}))
+
+        self.assertIn('"status": "sent"', result)
+        self.assertEqual(captured["to"], "lena.mueller@example.com")
+
+
+class RecipientEnvelopeTests(unittest.TestCase):
+    def test_address_parser_handles_realistic_outlook_headers(self):
+        mod = load_module()
+        self.assertEqual(
+            mod._parse_address_list(
+                '"One, Alice" <alice.one@example.com>',
+                '"Two, Bob" <bob.two@example.com>, '
+                '"Three,\r\n Carol" <carol.three@example.com>',
+            ),
+            [
+                "alice.one@example.com",
+                "bob.two@example.com",
+                "carol.three@example.com",
+            ],
+        )
+
+    def test_compose_uses_rfc_aware_addresses_for_smtp_envelope(self):
+        mod = load_module()
+        captured = {}
+
+        def fake_smtp_send(acct, sender, recipients, mime_str):
+            captured["recipients"] = recipients
+
+        with mock.patch.object(mod, "_smtp_send", side_effect=fake_smtp_send), \
+             mock.patch.object(mod, "_save_to_sent", return_value=None):
+            result = mod._compose_and_send(
+                {"address": "me@example.com"},
+                '"One, Alice" <alice@example.com>',
+                "Subject",
+                "Body",
+                cc='Müller, Lena <lena@example.com>, "Smith, Ann" <ann@example.com>',
+            )
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(
+            captured["recipients"],
+            ["alice@example.com", "lena@example.com", "ann@example.com"],
+        )
+
+    def test_compose_rejects_invalid_to_before_smtp(self):
+        mod = load_module()
+        with mock.patch.object(mod, "_smtp_send") as smtp_send:
+            result = mod._compose_and_send(
+                {"address": "me@example.com"},
+                "not an address",
+                "Subject",
+                "Body",
+            )
+
+        self.assertEqual(result, {"error": "No valid recipient address found in 'to'."})
+        smtp_send.assert_not_called()
+
 
 class AttachmentWorkflowTests(unittest.TestCase):
     def test_prepare_attachments_returns_metadata_without_reading_contents(self):

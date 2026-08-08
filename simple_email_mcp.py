@@ -27,6 +27,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from email.header import decode_header
+from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime, formatdate, make_msgid, getaddresses, formataddr
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -479,14 +480,34 @@ def _quote_body(body: str, sender: str, date: str) -> str:
     return f"On {date}, {sender} wrote:\n{quoted}"
 
 def _parse_address_list(*fields: Optional[str]) -> list[str]:
+    """Return deduplicated SMTP mailbox addresses from RFC-style fields.
+
+    Outlook sometimes emits an invalid but common form such as
+    ``Doe, Jane <jane@example.com>`` (an unquoted comma in the display name).
+    ``parseaddr`` rejects the whole value, while ``getaddresses`` still finds
+    the angle-bracket mailbox alongside a bogus display-name fragment.  Keep
+    only syntactically plausible mailbox values so those fragments can never
+    reach the SMTP envelope.
+    """
     addresses = []
     seen = set()
-    for _, addr in getaddresses([field for field in fields if field]):
+    unfolded_fields = [re.sub(r"\r?\n[ \t]*", " ", field) for field in fields if field]
+    for _, addr in getaddresses(unfolded_fields):
+        if not _looks_like_email(addr):
+            continue
         normalized = addr.strip().lower()
         if normalized and normalized not in seen:
             seen.add(normalized)
             addresses.append(addr.strip())
     return addresses
+
+def _reply_address(msg: Message) -> Optional[str]:
+    """Resolve Reply-To/From to one safe SMTP mailbox address."""
+    candidates = _parse_address_list(
+        _decode_header_value(msg.get("Reply-To")),
+        _decode_header_value(msg.get("From")),
+    )
+    return candidates[0] if candidates else None
 
 def _split_attachment_paths(file_attachments: Optional[str]) -> list[str]:
     if not file_attachments:
@@ -597,9 +618,10 @@ def _compose_and_send(
     if forwarded_parts:
         for part in forwarded_parts:
             mime.attach(part)
-    recipients = [a.strip() for a in to.split(",")]
-    if cc: recipients += [a.strip() for a in cc.split(",")]
-    if bcc: recipients += [a.strip() for a in bcc.split(",")]
+    to_recipients = _parse_address_list(to)
+    if not to_recipients:
+        return {"error": "No valid recipient address found in 'to'."}
+    recipients = _parse_address_list(to, cc, bcc)
     mime_str = mime.as_string()
     _smtp_send(acct, sender, recipients, mime_str)
     sent_warning = _save_to_sent(acct, mime_str)
@@ -789,7 +811,9 @@ async def _do_reply(p: Dict[str, Any]) -> str:
         orig_date = orig.get("Date", "")
         orig_body = _extract_body(orig)
         orig_msg_id = orig.get("Message-ID", "")
-        _, reply_addr = parseaddr(orig_from)
+        reply_addr = _reply_address(orig)
+        if not reply_addr:
+            return "Error: Original email has no valid Reply-To or From address."
         subject = orig_subject if re.match(r'(?i)^Re:\s', orig_subject) else f"Re: {orig_subject}"
         full_body = f"{p['body']}\n\n{_quote_body(orig_body, orig_from, orig_date)}"
         full_body_html = None
@@ -825,7 +849,9 @@ async def _do_reply_all(p: Dict[str, Any]) -> str:
         orig_date = orig.get("Date", "")
         orig_body = _extract_body(orig)
         orig_msg_id = orig.get("Message-ID", "")
-        _, reply_addr = parseaddr(orig_from)
+        reply_addr = _reply_address(orig)
+        if not reply_addr:
+            return "Error: Original email has no valid Reply-To or From address."
         my_addrs = {acct["address"].lower(), _sender_address(acct).lower()}
         cc_addrs = []
         seen_cc: set = set()

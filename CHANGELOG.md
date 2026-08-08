@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.1.1
+
+### Fixed
+
+- Fixed `reply` and `reply_all` for Outlook messages whose display names contain unquoted commas (for example, `Doe, Jane <jane@example.com>`).
+- SMTP envelope recipients are now parsed as RFC address lists instead of being split on commas, preserving quoted display names and rejecting invalid recipients before delivery.
+
 ## 2.1.0
 
 ### Added
