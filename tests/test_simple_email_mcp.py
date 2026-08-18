@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import email
 import importlib.util
@@ -316,6 +317,160 @@ class AttachmentWorkflowTests(unittest.TestCase):
             self.assertEqual(destination.read_text(), "hello")
             self.assertTrue(saved["overwritten"])
             self.assertEqual(saved["saved"], str(destination))
+
+
+class InlineAttachmentDetectionTests(unittest.TestCase):
+    def test_apple_mail_style_inline_disposition_is_listed_and_resolvable(self):
+        mod = load_module()
+        payload = base64.b64encode(b"PDFDATA").decode()
+        message = email.message_from_string(
+            "\n".join(
+                [
+                    "From: sender@example.com",
+                    "To: me@example.com",
+                    "Subject: Quote",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/mixed; boundary="boundary"',
+                    "",
+                    "--boundary",
+                    'Content-Type: text/plain; charset="utf-8"',
+                    "",
+                    "Body text",
+                    "--boundary",
+                    'Content-Type: application/pdf; name="cotizacion.pdf"',
+                    'Content-Disposition: inline; filename="cotizacion.pdf"',
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    payload,
+                    "--boundary--",
+                ]
+            )
+        )
+
+        attachments = mod._list_attachments(message)
+        self.assertEqual(len(attachments), 1)
+        entry = attachments[0]
+        self.assertEqual(entry["filename"], "cotizacion.pdf")
+        self.assertEqual(entry["content_type"], "application/pdf")
+        self.assertEqual(entry["size_bytes"], len(b"PDFDATA"))
+        self.assertEqual(entry["disposition"], "inline")
+
+        class FakeConn:
+            def uid(self, command, uid, query):
+                return "OK", [(b"1 (RFC822 {0})", message.as_bytes())]
+
+            def logout(self):
+                return "BYE", [b"logged out"]
+
+        @contextlib.contextmanager
+        def fake_imap_session(acct, folder=None, readonly=True):
+            yield FakeConn()
+
+        with mock.patch.dict(mod._accounts, {"default": {"address": "me@example.com"}}, clear=True), \
+             mock.patch.object(mod, "_refresh_runtime_config"), \
+             mock.patch.object(mod, "_imap_session", fake_imap_session):
+            fetched = json.loads(
+                asyncio.run(
+                    mod._do_get_attachment(account=None, uid="1", folder="INBOX", attachment_index=entry["index"])
+                )
+            )
+        self.assertEqual(fetched["filename"], "cotizacion.pdf")
+        self.assertEqual(base64.b64decode(fetched["content_base64"]), b"PDFDATA")
+
+    def test_classic_attachment_disposition_still_detected(self):
+        mod = load_module()
+        message = email.message_from_string(
+            "\n".join(
+                [
+                    "From: sender@example.com",
+                    "To: me@example.com",
+                    "Subject: Attachment",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/mixed; boundary="boundary"',
+                    "",
+                    "--boundary",
+                    'Content-Type: text/plain; charset="utf-8"',
+                    "",
+                    "Body text",
+                    "--boundary",
+                    "Content-Type: text/plain",
+                    'Content-Disposition: attachment; filename="test.txt"',
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    "aGVsbG8=",
+                    "--boundary--",
+                ]
+            )
+        )
+
+        attachments = mod._list_attachments(message)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "test.txt")
+        self.assertEqual(attachments[0]["disposition"], "attachment")
+
+    def test_content_type_name_param_without_disposition_header_is_detected(self):
+        mod = load_module()
+        payload = base64.b64encode(b"IMGDATA").decode()
+        message = email.message_from_string(
+            "\n".join(
+                [
+                    "From: sender@example.com",
+                    "To: me@example.com",
+                    "Subject: Logo",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/mixed; boundary="boundary"',
+                    "",
+                    "--boundary",
+                    'Content-Type: text/plain; charset="utf-8"',
+                    "",
+                    "Body text",
+                    "--boundary",
+                    'Content-Type: image/png; name="logo.png"',
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    payload,
+                    "--boundary--",
+                ]
+            )
+        )
+
+        attachments = mod._list_attachments(message)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "logo.png")
+        self.assertEqual(attachments[0]["disposition"], "")
+
+    def test_body_extraction_skips_inline_file_and_ignores_text_part_with_filename(self):
+        mod = load_module()
+        payload = base64.b64encode(b"Should not be body").decode()
+        message = email.message_from_string(
+            "\n".join(
+                [
+                    "From: sender@example.com",
+                    "To: me@example.com",
+                    "Subject: Notes",
+                    "MIME-Version: 1.0",
+                    'Content-Type: multipart/mixed; boundary="boundary"',
+                    "",
+                    "--boundary",
+                    'Content-Type: text/plain; charset="utf-8"',
+                    "",
+                    "Real body",
+                    "--boundary",
+                    'Content-Type: text/plain; name="notes.txt"',
+                    'Content-Disposition: inline; filename="notes.txt"',
+                    "Content-Transfer-Encoding: base64",
+                    "",
+                    payload,
+                    "--boundary--",
+                ]
+            )
+        )
+
+        self.assertEqual(mod._extract_body(message), "Real body")
+
+        attachments = mod._list_attachments(message)
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0]["filename"], "notes.txt")
 
 
 class RuntimeConfigReloadTests(unittest.TestCase):

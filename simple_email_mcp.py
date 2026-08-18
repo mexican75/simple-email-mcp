@@ -387,14 +387,20 @@ def _decode_header_value(value: Optional[str]) -> str:
             decoded.append(fragment)
     return " ".join(decoded)
 
+def _is_attachment_part(part: email.message.Message) -> bool:
+    if part.is_multipart():
+        return False
+    if "attachment" in str(part.get("Content-Disposition", "")):
+        return True
+    return part.get_filename() is not None
+
 def _extract_body(msg: email.message.Message) -> str:
     if msg.is_multipart():
         text_part = html_part = None
         for part in msg.walk():
-            ct = part.get_content_type()
-            disp = str(part.get("Content-Disposition", ""))
-            if "attachment" in disp:
+            if _is_attachment_part(part):
                 continue
+            ct = part.get_content_type()
             if ct == "text/plain" and text_part is None:
                 text_part = part
             elif ct == "text/html" and html_part is None:
@@ -415,11 +421,13 @@ def _list_attachments(msg: email.message.Message) -> list[dict]:
     if not msg.is_multipart():
         return attachments
     for idx, part in enumerate(msg.walk()):
-        disp = str(part.get("Content-Disposition", ""))
-        if "attachment" in disp:
-            filename = _decode_header_value(part.get_filename())
-            size = len(part.get_payload(decode=True) or b"")
-            attachments.append({"index": idx, "filename": filename or "(unnamed)", "size_bytes": size, "content_type": part.get_content_type()})
+        if not _is_attachment_part(part):
+            continue
+        disp = str(part.get("Content-Disposition", "")).lower()
+        disposition = "attachment" if "attachment" in disp else ("inline" if "inline" in disp else "")
+        filename = _decode_header_value(part.get_filename())
+        size = len(part.get_payload(decode=True) or b"")
+        attachments.append({"index": idx, "filename": filename or "(unnamed)", "size_bytes": size, "content_type": part.get_content_type(), "disposition": disposition})
     return attachments
 
 def _msg_to_summary(msg: email.message.Message, uid: str) -> dict:
@@ -428,7 +436,10 @@ def _msg_to_summary(msg: email.message.Message, uid: str) -> dict:
         date_formatted = parsedate_to_datetime(date_str).strftime("%Y-%m-%d %H:%M")
     except Exception:
         date_formatted = date_str
-    return {"uid": uid, "from": _decode_header_value(msg.get("From")), "to": _decode_header_value(msg.get("To")), "subject": _decode_header_value(msg.get("Subject")), "date": date_formatted, "has_attachments": msg.get_content_type() == "multipart/mixed"}
+    # list_emails/search only fetch RFC822.HEADER, so parts can't be walked here;
+    # fall back to the top-level Content-Type as a heuristic.
+    has_attachments = msg.get_content_type() in ("multipart/mixed", "multipart/related")
+    return {"uid": uid, "from": _decode_header_value(msg.get("From")), "to": _decode_header_value(msg.get("To")), "subject": _decode_header_value(msg.get("Subject")), "date": date_formatted, "has_attachments": has_attachments}
 
 def _find_sent_folder(conn: imaplib.IMAP4_SSL, acct: Dict[str, Any]) -> str:
     cache_key = acct["address"]
@@ -906,7 +917,7 @@ async def _do_forward(p: Dict[str, Any]) -> str:
         forwarded_parts = []
         if p.get("include_attachments", True) and orig.is_multipart():
             for part in orig.walk():
-                if "attachment" in str(part.get("Content-Disposition", "")):
+                if _is_attachment_part(part):
                     forwarded_parts.append(part)
         result = _compose_and_send(acct, p["to"], subject, full_body, body_html=full_body_html, file_attachments=p.get("attachments"), inline_attachments=p.get("attachments_inline"), forwarded_parts=forwarded_parts)
         if "error" in result:
@@ -956,7 +967,7 @@ async def _do_save_attachment(account: Optional[str], uid: str, folder: str, att
             msg = email.message_from_bytes(raw)
             for idx, part in enumerate(msg.walk()):
                 if idx == attachment_index:
-                    if "attachment" not in str(part.get("Content-Disposition", "")):
+                    if not _is_attachment_part(part):
                         return f"Error: Part at index {idx} is not an attachment."
                     filename = _decode_header_value(part.get_filename()) or "(unnamed)"
                     payload = part.get_payload(decode=True) or b""
@@ -986,7 +997,7 @@ async def _do_get_attachment(account: Optional[str], uid: str, folder: str, atta
             msg = email.message_from_bytes(raw)
             for idx, part in enumerate(msg.walk()):
                 if idx == attachment_index:
-                    if "attachment" not in str(part.get("Content-Disposition", "")):
+                    if not _is_attachment_part(part):
                         return f"Error: Part at index {idx} is not an attachment."
                     filename = _decode_header_value(part.get_filename()) or "(unnamed)"
                     payload = part.get_payload(decode=True) or b""
